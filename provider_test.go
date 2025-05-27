@@ -6,7 +6,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/libdns/hetzner"
 	"github.com/libdns/libdns"
@@ -15,13 +14,13 @@ import (
 var (
 	envToken = ""
 	envZone  = ""
-	ttl      = time.Duration(120 * time.Second)
+	ttl      = 120
 )
 
 type testRecordsCleanup = func()
 
 func setupTestRecords(t *testing.T, p *hetzner.Provider) ([]libdns.Record, testRecordsCleanup) {
-	testRecords := []libdns.Record{
+	testRecords := []hetzner.Record{
 		{
 			Type:  "TXT",
 			Name:  "test1",
@@ -40,7 +39,8 @@ func setupTestRecords(t *testing.T, p *hetzner.Provider) ([]libdns.Record, testR
 		},
 	}
 
-	records, err := p.AppendRecords(context.TODO(), envZone, testRecords)
+	records, err := p.AppendRecords(context.TODO(), envZone, toLibdnsRecords(testRecords))
+
 	if err != nil {
 		t.Fatal(err)
 		return nil, func() {}
@@ -53,9 +53,20 @@ func setupTestRecords(t *testing.T, p *hetzner.Provider) ([]libdns.Record, testR
 
 func cleanupRecords(t *testing.T, p *hetzner.Provider, r []libdns.Record) {
 	_, err := p.DeleteRecords(context.TODO(), envZone, r)
+
 	if err != nil {
 		t.Fatalf("cleanup failed: %v", err)
 	}
+}
+
+func toLibdnsRecords(records []hetzner.Record) []libdns.Record {
+	list := make([]libdns.Record, len(records))
+
+	for i, r := range records {
+		list[i], _ = r.Parse(envZone)
+	}
+
+	return list
 }
 
 func TestMain(m *testing.M) {
@@ -73,23 +84,43 @@ Example: "LIBDNS_HETZNER_TEST_TOKEN="123" LIBDNS_HETZNER_TEST_ZONE="my-domain.co
 	os.Exit(m.Run())
 }
 
-func Test_AppendRecords(t *testing.T) {
-	p := &hetzner.Provider{
-		AuthAPIToken: envToken,
+func TestProvider_GetRecords(t *testing.T) {
+	p := hetzner.New(envToken)
+	_, cleanupFunc := setupTestRecords(t, p)
+	defer cleanupFunc()
+	records, err := p.GetRecords(context.TODO(), envZone)
+
+	if err != nil {
+		t.Fatal(err)
 	}
 
+	found := 0
+
+	for _, record := range records {
+		if record.RR().Name == "test1" || record.RR().Name == "test2" || record.RR().Name == "test3" {
+			found++
+		}
+	}
+
+	if found != 3 {
+		t.Fatalf("found %d records, expected 3", found)
+	}
+}
+
+func TestProvider_AppendRecords(t *testing.T) {
+	p := hetzner.New(envToken)
 	testCases := []struct {
-		records  []libdns.Record
-		expected []libdns.Record
+		records  []hetzner.Record
+		expected []hetzner.Record
 	}{
 		{
 			// multiple records
-			records: []libdns.Record{
+			records: []hetzner.Record{
 				{Type: "TXT", Name: "test_1", Value: "test_1", TTL: ttl},
 				{Type: "TXT", Name: "test_2", Value: "test_2", TTL: ttl},
 				{Type: "TXT", Name: "test_3", Value: "test_3", TTL: ttl},
 			},
-			expected: []libdns.Record{
+			expected: []hetzner.Record{
 				{Type: "TXT", Name: "test_1", Value: "test_1", TTL: ttl},
 				{Type: "TXT", Name: "test_2", Value: "test_2", TTL: ttl},
 				{Type: "TXT", Name: "test_3", Value: "test_3", TTL: ttl},
@@ -97,28 +128,28 @@ func Test_AppendRecords(t *testing.T) {
 		},
 		{
 			// relative name
-			records: []libdns.Record{
+			records: []hetzner.Record{
 				{Type: "TXT", Name: "123.test", Value: "123", TTL: ttl},
 			},
-			expected: []libdns.Record{
+			expected: []hetzner.Record{
 				{Type: "TXT", Name: "123.test", Value: "123", TTL: ttl},
 			},
 		},
 		{
 			// (fqdn) sans trailing dot
-			records: []libdns.Record{
+			records: []hetzner.Record{
 				{Type: "TXT", Name: fmt.Sprintf("123.test.%s", strings.TrimSuffix(envZone, ".")), Value: "test", TTL: ttl},
 			},
-			expected: []libdns.Record{
+			expected: []hetzner.Record{
 				{Type: "TXT", Name: "123.test", Value: "test", TTL: ttl},
 			},
 		},
 		{
 			// fqdn with trailing dot
-			records: []libdns.Record{
+			records: []hetzner.Record{
 				{Type: "TXT", Name: fmt.Sprintf("123.test.%s.", strings.TrimSuffix(envZone, ".")), Value: "test", TTL: ttl},
 			},
-			expected: []libdns.Record{
+			expected: []hetzner.Record{
 				{Type: "TXT", Name: "123.test", Value: "test", TTL: ttl},
 			},
 		},
@@ -126,10 +157,12 @@ func Test_AppendRecords(t *testing.T) {
 
 	for _, c := range testCases {
 		func() {
-			result, err := p.AppendRecords(context.TODO(), envZone+".", c.records)
+			result, err := p.AppendRecords(context.TODO(), envZone+".", toLibdnsRecords(c.records))
+
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			defer cleanupRecords(t, p, result)
 
 			if len(result) != len(c.records) {
@@ -137,95 +170,68 @@ func Test_AppendRecords(t *testing.T) {
 			}
 
 			for k, r := range result {
-				if len(result[k].ID) == 0 {
-					t.Fatalf("len(result[%d].ID) == 0", k)
+				rr := r.RR()
+
+				if rr.Type != c.expected[k].Type {
+					t.Fatalf("r.Type != c.exptected[%d].Type => %s != %s", k, rr.Type, c.expected[k].Type)
 				}
-				if r.Type != c.expected[k].Type {
-					t.Fatalf("r.Type != c.exptected[%d].Type => %s != %s", k, r.Type, c.expected[k].Type)
+
+				if rr.Name != c.expected[k].Name {
+					t.Fatalf("r.Name != c.exptected[%d].Name => %s != %s", k, rr.Name, c.expected[k].Name)
 				}
-				if r.Name != c.expected[k].Name {
-					t.Fatalf("r.Name != c.exptected[%d].Name => %s != %s", k, r.Name, c.expected[k].Name)
+
+				if rr.Data != c.expected[k].Value {
+					t.Fatalf("r.Value != c.exptected[%d].Value => %s != %s", k, rr.Data, c.expected[k].Value)
 				}
-				if r.Value != c.expected[k].Value {
-					t.Fatalf("r.Value != c.exptected[%d].Value => %s != %s", k, r.Value, c.expected[k].Value)
-				}
-				if r.TTL != c.expected[k].TTL {
-					t.Fatalf("r.TTL != c.exptected[%d].TTL => %s != %s", k, r.TTL, c.expected[k].TTL)
+
+				if int(rr.TTL.Seconds()) != c.expected[k].TTL {
+					t.Fatalf("r.TTL != c.exptected[%d].TTL => %s != %v", k, rr.TTL, c.expected[k].TTL)
 				}
 			}
 		}()
 	}
 }
 
-func Test_DeleteRecords(t *testing.T) {
-	p := &hetzner.Provider{
-		AuthAPIToken: envToken,
-	}
+func TestProvider_DeleteRecords(t *testing.T) {
+	p := hetzner.New(envToken)
+	setupTestRecords(t, p)
+	deleted, err := p.DeleteRecords(context.TODO(), envZone, toLibdnsRecords([]hetzner.Record{
+		{
+			Type:  "TXT",
+			Name:  "test2",
+			Value: "test2",
+			TTL:   ttl,
+		},
+	}))
 
-	testRecords, cleanupFunc := setupTestRecords(t, p)
-	defer cleanupFunc()
-
-	records, err := p.GetRecords(context.TODO(), envZone)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if len(records) < len(testRecords) {
-		t.Fatalf("len(records) < len(testRecords) => %d < %d", len(records), len(testRecords))
+	if len(deleted) != 1 {
+		t.Fatalf("len(deleted) != 1 => %d", len(deleted))
 	}
 
-	for _, testRecord := range testRecords {
-		var foundRecord *libdns.Record
-		for _, record := range records {
-			if testRecord.ID == record.ID {
-				foundRecord = &testRecord
-			}
-		}
-
-		if foundRecord == nil {
-			t.Fatalf("Record not found => %s", testRecord.ID)
-		}
+	if deleted[0].RR().Name != "test2" {
+		t.Fatalf("deleted[0].RR().Name != 'test2' => %s", deleted[0].RR().Name)
 	}
+
+	cleanupRecords(t, p, toLibdnsRecords([]hetzner.Record{
+		{
+			Type: "TXT",
+			Name: "test1",
+		},
+		{
+			Type: "TXT",
+			Name: "test3",
+		},
+	}))
 }
 
-func Test_GetRecords(t *testing.T) {
-	p := &hetzner.Provider{
-		AuthAPIToken: envToken,
-	}
-
-	testRecords, cleanupFunc := setupTestRecords(t, p)
-	defer cleanupFunc()
-
-	records, err := p.GetRecords(context.TODO(), envZone)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(records) < len(testRecords) {
-		t.Fatalf("len(records) < len(testRecords) => %d < %d", len(records), len(testRecords))
-	}
-
-	for _, testRecord := range testRecords {
-		var foundRecord *libdns.Record
-		for _, record := range records {
-			if testRecord.ID == record.ID {
-				foundRecord = &testRecord
-			}
-		}
-
-		if foundRecord == nil {
-			t.Fatalf("Record not found => %s", testRecord.ID)
-		}
-	}
-}
-
-func Test_SetRecords(t *testing.T) {
-	p := &hetzner.Provider{
-		AuthAPIToken: envToken,
-	}
-
+func TestProvider_SetRecords(t *testing.T) {
+	p := hetzner.New(envToken)
 	existingRecords, _ := setupTestRecords(t, p)
-	newTestRecords := []libdns.Record{
+	newTestRecords := []hetzner.Record{
 		{
 			Type:  "TXT",
 			Name:  "new_test1",
@@ -239,21 +245,26 @@ func Test_SetRecords(t *testing.T) {
 			TTL:   ttl,
 		},
 	}
-
-	allRecords := append(existingRecords, newTestRecords...)
-	allRecords[0].Value = "new_value"
-
+	allRecords := append(existingRecords, toLibdnsRecords(newTestRecords)...)
+	allRecords[0] = &hetzner.Record{
+		Type:  allRecords[0].RR().Type,
+		Name:  allRecords[0].RR().Name,
+		TTL:   int(allRecords[0].RR().TTL.Seconds()),
+		Value: "new_value",
+	}
 	records, err := p.SetRecords(context.TODO(), envZone, allRecords)
+
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer cleanupRecords(t, p, records)
 
 	if len(records) != len(allRecords) {
 		t.Fatalf("len(records) != len(allRecords) => %d != %d", len(records), len(allRecords))
 	}
 
-	if records[0].Value != "new_value" {
-		t.Fatalf(`records[0].Value != "new_value" => %s != "new_value"`, records[0].Value)
+	if records[0].RR().Data != "new_value" {
+		t.Fatalf(`records[0].Value != "new_value" => %s != "new_value"`, records[0].RR().Data)
 	}
 }
